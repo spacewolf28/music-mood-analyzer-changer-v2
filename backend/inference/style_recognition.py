@@ -1,0 +1,78 @@
+import librosa
+import numpy as np
+import joblib
+import scipy.signal
+
+# 修复 hann 问题
+if not hasattr(scipy.signal, "hann"):
+    scipy.signal.hann = scipy.signal.windows.hann
+
+MODEL_PATH = "backend/models/style_model.pkl"
+ENCODER_PATH = "backend/models/style_label_encoder.pkl"
+
+
+def extract_style_features(path):
+    """
+    === 与训练脚本严格一致的68维特征 ===
+    顺序必须是：
+    [tempo, rms, centroid] +
+    chroma(12) +
+    mel(40) +
+    contrast(7) +
+    tonnetz(6)
+    """
+    y, sr = librosa.load(path, sr=None, mono=True)
+
+    # tempo
+    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+
+    # rms
+    rms = librosa.feature.rms(y=y)[0].mean()
+
+    # spectral centroid
+    centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0].mean()
+
+    # chroma 12维
+    chroma = librosa.feature.chroma_stft(y=y, sr=sr).mean(axis=1)
+
+    # mel 40维
+    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=40)
+    mel_mean = mel.mean(axis=1)
+
+    # contrast 7维
+    contrast = librosa.feature.spectral_contrast(y=y, sr=sr).mean(axis=1)
+
+    # tonnetz 6维
+    try:
+        tonnetz = librosa.feature.tonnetz(
+            y=librosa.effects.harmonic(y),
+            sr=sr
+        ).mean(axis=1)
+    except Exception:
+        tonnetz = np.zeros(6)
+
+    # === 拼接成最终 68 维（顺序严格一致） ===
+    feature = np.concatenate([
+        [tempo, rms, centroid],
+        chroma,
+        mel_mean,
+        contrast,
+        tonnetz
+    ])
+
+    return feature.reshape(1, -1)
+
+
+def predict_style(path):
+    model = joblib.load(MODEL_PATH)
+    encoder = joblib.load(ENCODER_PATH)
+
+    feat = extract_style_features(path)
+    pred = model.predict(feat)[0]
+
+    return encoder.inverse_transform([pred])[0]
+
+
+if __name__ == "__main__":
+    test_path = r"D:\idea_python\music_project\backend\test_audio.wav"
+    print("预测风格:", predict_style(test_path))
