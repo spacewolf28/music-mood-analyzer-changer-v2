@@ -1,137 +1,90 @@
 # backend/inference/melody_transformer.py
 
+from pathlib import Path
 import numpy as np
+import soundfile as sf
 import librosa
 
 
 class MelodyTransformer:
     """
-    MelodyTransformer (A1 模式)
-    - 大幅修改旋律的音高和节奏，但保留大致轮廓。
-    - 不再只是轻微变化，而是“几乎认不出”，仍有一点影子。
+    多 attempt 旋律轻度变形器：
+
+    - attempt 1: 不做变形
+    - attempt 2: 轻微 time stretch (0.97~1.03)
+    - attempt 3: 再加 pitch shift (-0.5~+0.5 半音)
+    - attempt >=4: time stretch + pitch shift (-1~+1 半音)
+
+    支持新旧 librosa 版本，自动修复 time_stretch 参数问题。
     """
 
-    def __init__(self, target_sr=32000):
+    def __init__(self, target_sr: int = 32000):
         self.target_sr = target_sr
 
-    def _get_pitch_shift(self, style: str, emotion: str, strength: float) -> float:
-        """
-        根据目标风格 + 情绪，决定整体升降调的范围。
-        返回值单位：半音（semitones）
-        """
-        style = style.lower()
-        emotion = emotion.lower()
+    @staticmethod
+    def _safe_time_stretch(y, rate):
+        """兼容 librosa 0.10+ 和旧版本的 time_stretch 调用方式。"""
+        try:
+            # 新版 librosa 需要关键字参数
+            return librosa.effects.time_stretch(y=y, rate=rate)
+        except TypeError:
+            # 旧版 librosa 是位置参数
+            return librosa.effects.time_stretch(y, rate)
 
-        base_shift = 0.0
+    @staticmethod
+    def _safe_pitch_shift(y, sr, steps):
+        """兼容 librosa pitch_shift（API 变化不大，但以防未来改版）"""
+        try:
+            return librosa.effects.pitch_shift(y=y, sr=sr, n_steps=steps)
+        except TypeError:
+            return librosa.effects.pitch_shift(y, sr, steps)
 
-        # 情绪对音高的“大方向”影响
-        if emotion == "happy":
-            base_shift += 4.0   # 明亮很多
-        elif emotion == "funny":
-            base_shift += 5.0
-        elif emotion == "angry":
-            base_shift += 3.0
-        elif emotion == "sad":
-            base_shift -= 4.0
-        elif emotion == "scary":
-            base_shift -= 3.0
-        elif emotion == "tender":
-            base_shift -= 2.0
+    def transform(self, melody_path: str, attempt: int) -> str:
+        melody_path = str(melody_path)
+        if attempt <= 1:
+            return melody_path
 
-        # 风格对音高的微调
-        if style in ["jazz", "pop"]:
-            base_shift += 1.0
-        elif style in ["electronic"]:
-            base_shift += 2.0
-        elif style in ["classical"]:
-            base_shift += 0.0
-        elif style in ["rock"]:
-            base_shift += 1.0
+        y, sr = sf.read(melody_path)
+        if y.ndim > 1:
+            y = y.mean(axis=1)
 
-        # 限制到 [-7, 7] 半音左右
-        base_shift = max(min(base_shift, 7.0), -7.0)
+        if sr != self.target_sr:
+            y = librosa.resample(y, orig_sr=sr, target_sr=self.target_sr)
+            sr = self.target_sr
 
-        # 按强度缩放
-        shift = base_shift * strength
-        return shift
+        # ----- 根据 attempt 决定变形强度 -----
+        if attempt == 2:
+            rate = float(np.random.uniform(0.97, 1.03))
+            steps = 0.0
+        elif attempt == 3:
+            rate = float(np.random.uniform(0.95, 1.05))
+            steps = float(np.random.uniform(-0.5, 0.5))
+        else:
+            rate = float(np.random.uniform(0.92, 1.08))
+            steps = float(np.random.uniform(-1.0, 1.0))
 
-    def _get_time_stretch(self, style: str, emotion: str, strength: float) -> float:
-        """
-        返回 time stretch 比例：
-        >1 变快，<1 变慢
-        """
-        style = style.lower()
-        emotion = emotion.lower()
+        # ----- Time Stretch -----
+        if abs(rate - 1.0) > 0.01:
+            y = self._safe_time_stretch(y, rate)
 
-        base_rate = 1.0
+        # ----- Pitch Shift -----
+        if abs(steps) > 0.05:
+            y = self._safe_pitch_shift(y, sr, steps)
 
-        # 情绪改变节奏感
-        if emotion in ["happy", "funny", "angry"]:
-            base_rate = 1.25   # 明显快不少
-        elif emotion in ["sad", "tender"]:
-            base_rate = 0.80   # 明显慢
-        elif emotion == "scary":
-            base_rate = 0.90
+        # ----- Normalize -----
+        max_abs = float(np.max(np.abs(y)))
+        if max_abs > 1e-6:
+            y = y / max_abs * 0.9
 
-        # 风格微调
-        if style == "lofi":
-            base_rate *= 0.9
-        elif style == "electronic":
-            base_rate *= 1.1
+        # ----- Save -----
+        out_path = Path(melody_path).with_name(
+            Path(melody_path).stem + f"_t{attempt}.wav"
+        )
+        sf.write(str(out_path), y, sr)
 
-        # 按强度缩放偏移
-        rate = 1.0 + (base_rate - 1.0) * strength
-        return rate
+        print(
+            f"[MelodyTransformer] Transformed melody for attempt {attempt} → {out_path} "
+            f"(rate={rate:.3f}, steps={steps:.2f})"
+        )
 
-    def transform(self, y, sr, style: str, emotion: str, strength: float = 0.9):
-        """
-        对旋律做大幅变形。
-        y: mono waveform
-        sr: 采样率
-        strength: 0~1, 越大变化越猛烈（A1 推荐 0.8~0.95）
-        """
-        # 归一化，避免数值爆炸
-        if np.max(np.abs(y)) > 1e-6:
-            y = y / np.max(np.abs(y)) * 0.9
-
-        # 限制输入长度，避免时间拉伸时太慢
-        MAX_INPUT_SECONDS = 12
-        max_len = int(sr * MAX_INPUT_SECONDS)
-        if len(y) > max_len:
-            y = y[:max_len]
-
-        # -------- 1. 全局 Pitch Shift --------
-        pitch_shift_steps = self._get_pitch_shift(style, emotion, strength)
-        if abs(pitch_shift_steps) > 0.1:
-            try:
-                y = librosa.effects.pitch_shift(y, sr=sr, n_steps=pitch_shift_steps)
-            except Exception as e:
-                print("[MelodyTransformer] pitch_shift failed:", e)
-
-        # -------- 2. Time Stretch（节奏大改） --------
-        rate = self._get_time_stretch(style, emotion, strength)
-        if abs(rate - 1.0) > 0.05:
-            try:
-                y = librosa.effects.time_stretch(y, rate=rate)
-            except Exception as e:
-                print("[MelodyTransformer] time_stretch failed:", e)
-
-        # -------- 3. 轻微随机抖动（幅度变化 + 很轻微噪声）--------
-        # 增加一点随机感，但不做逐帧 pitch jitter（太重）
-        if np.max(np.abs(y)) > 1e-6:
-            y = y / np.max(np.abs(y)) * 0.8
-
-        # 增加非常轻微的随机包络
-        rng = np.random.default_rng()
-        env = rng.normal(loc=1.0, scale=0.03, size=len(y))
-        env = np.clip(env, 0.85, 1.15)
-        y = y * env
-
-        # 轻噪音，防止太“干净”
-        y += rng.normal(scale=0.0015, size=len(y))
-
-        # 最后再归一化
-        if np.max(np.abs(y)) > 1e-6:
-            y = y / np.max(np.abs(y)) * 0.7
-
-        return y, sr
+        return str(out_path)
