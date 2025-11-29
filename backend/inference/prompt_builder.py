@@ -1,179 +1,197 @@
-# backend/inference/prompt_builder.py
+import numpy as np
+from backend.inference.melody_scorer import MelodyScorer
+
 
 class PromptBuilder:
     """
-    方案 A：多 attempt 用的最终 Prompt 构造器
-
-    - 使用你的模型分析得到：
-        * 原始风格 orig_style
-        * 原始情绪 orig_emotion
-    - 使用用户指定目标：
-        * target_style
-        * target_emotion
-    - 随 attempt 变化：
-        * 旋律保留比例（从保守到弱化）
-        * 风格/情绪强化程度
-    - 加入防静音 / 连续性 / 高质量混音描述
+    Friendly-Prompt 版本（音乐结构友好 + 正向引导）
+    不使用任何负面词语，不再出现：
+        - unknown pitch range
+        - unclear contour
+        - weak hook
+        - irregular rhythm
+        - loosely related to scale
+    避免让 MusicGen 往“黑暗/恐怖/混乱”方向生成。
     """
 
-    STYLE_PROFILE = {
-        "pop": {
-            "tempo": "medium tempo (~110 BPM)",
-            "energy": "balanced dynamics",
-            "brightness": "clean and modern tone",
-            "harmony": "catchy pop chord progressions",
-            "texture": "bright synth and pad textures",
-            "instrument": "modern drums, bright synths, electric bass, piano, pads",
-        },
-        "rock": {
-            "tempo": "fast tempo (~130–150 BPM)",
-            "energy": "strong, punchy dynamics",
-            "brightness": "bright guitar-driven tone",
-            "harmony": "power chords and energetic rock riffs",
-            "texture": "high-frequency guitar texture",
-            "instrument": "distorted electric guitars, aggressive drums, bass",
-        },
-        "jazz": {
-            "tempo": "slow to medium tempo (~80–110 BPM)",
-            "energy": "smooth, laid-back dynamics",
-            "brightness": "warm, mellow tone",
-            "harmony": "extended jazz chords and ii–V–I progressions",
-            "texture": "rich mid-frequency harmonic texture",
-            "instrument": "upright bass, jazz piano, brushed drums, saxophone",
-        },
-        "classical": {
-            "tempo": "expressive, flexible tempo",
-            "energy": "wide dynamic range",
-            "brightness": "balanced orchestral tone",
-            "harmony": "classical orchestration and voice leading",
-            "texture": "full-spectrum orchestral texture",
-            "instrument": "strings, woodwinds, brass, piano",
-        },
-        "electronic": {
-            "tempo": "steady fast tempo (~120–140 BPM)",
-            "energy": "high intensity with strong low end",
-            "brightness": "bright synthetic tone",
-            "harmony": "simple, repetitive EDM-style harmony",
-            "texture": "sidechain pumping synth textures",
-            "instrument": "synth leads, pads, EDM drums, sub bass, FX",
-        },
-    }
+    def __init__(self):
+        # 给 full_pipeline 用的旋律评分器
+        self.scorer = MelodyScorer()
 
-    EMOTION_PROFILE = {
-        "happy": "bright, uplifting, joyful feeling",
-        "sad": "soft, emotional, melancholic mood",
-        "angry": "intense, aggressive, high-energy emotion",
-        "scary": "dark, tense, suspenseful atmosphere",
-        "tender": "warm, intimate, gentle emotion",
-        "funny": "playful, quirky, humorous character",
-    }
+    # -----------------------------
+    # Melody Element Description
+    # -----------------------------
 
-    @classmethod
-    def _describe_style(cls, style: str) -> str:
-        style = (style or "").lower()
-        s = cls.STYLE_PROFILE.get(style)
-        if not s:
-            return f"{style} style music"
-        return (
-            f"{s['tempo']}, {s['energy']}, {s['brightness']}, "
-            f"{s['harmony']}, {s['texture']}. Typical instruments: {s['instrument']}."
-        )
+    def describe_pitch_range(self, pr):
+        if pr < 40:
+            return "a smooth and gentle pitch range"
+        elif pr < 120:
+            return "a moderate and expressive pitch range"
+        else:
+            return "a wide and energetic pitch range"
 
-    @classmethod
+    def describe_contour(self, contour_score):
+        if contour_score > 0.65:
+            return "a clear and flowing melodic contour"
+        elif contour_score > 0.35:
+            return "a lightly shaped melodic contour"
+        else:
+            return "a simple contour with room for creative expansion"
+
+    def describe_hook(self, hook_score):
+        if hook_score > 0.45:
+            return "a memorable melodic hook"
+        elif hook_score > 0.25:
+            return "a mildly recognizable hook"
+        else:
+            return "a simple motif that can be further developed"
+
+    def describe_rhythm(self, rhythm_score):
+        if rhythm_score > 0.55:
+            return "a stable rhythmic pattern"
+        elif rhythm_score > 0.35:
+            return "a light rhythmic motion"
+        else:
+            return "a flexible rhythm that allows stylistic reinterpretation"
+
+    def describe_scale(self, scale_corr):
+        if scale_corr > 0.6:
+            return "closely aligned with a musical scale"
+        elif scale_corr > 0.35:
+            return "generally aligned with a musical scale"
+        else:
+            return "melodically open, suitable for stylistic adaptation"
+
+    # -----------------------------
+    # Style-specific description（核心增强）
+    # -----------------------------
+
+    def describe_style(self, target_style: str):
+        """
+        根据 target_style 返回:
+        - core_name: 展示用名字（放在 **...** 里）
+        - focus_block: 多行 bullet，用于 "Focus on:" 部分
+        """
+        s = (target_style or "").strip().lower()
+
+        if s == "rock":
+            core = "energetic rock"
+            focus = """- distorted electric guitars with overdrive and palm-muted riffs
+- punchy acoustic or electronic drums with a strong backbeat on 2 and 4
+- tight bass line locking with the kick drum
+- clearly defined verse–chorus structure with powerful transitions"""
+        elif s == "jazz":
+            core = "swing jazz"
+            focus = """- swing rhythm with a laid-back groove (triplet feel)
+- walking bass lines outlining extended chords
+- piano or guitar comping with jazz harmony (7th, 9th, 11th chords)
+- light acoustic drums with ride cymbal patterns and subtle fills"""
+        elif s == "electronic":
+            core = "modern electronic"
+            focus = """- punchy electronic kick drum and snare in a steady beat
+- deep sub bass and sidechain-style pumping groove
+- bright synth leads and pads with clear stereo width
+- electronic sound design elements such as risers, sweeps and effects"""
+        elif s == "pop":
+            core = "modern pop"
+            focus = """- clean and bright production with a polished mix
+- catchy chord progressions and memorable hooks
+- tight pop drums with clear kick, snare and hi-hats
+- layered synths, guitars or keys supporting the vocal-style melody"""
+        elif s == "classical":
+            core = "orchestral classical"
+            focus = """- orchestral instrumentation such as strings, woodwinds and brass
+- structured harmonic progression with clear phrases
+- dynamic shaping with crescendos and decrescendos
+- expressive legato lines and voice leading between parts"""
+        else:
+            core = target_style or "a clear musical"
+            focus = """- instrumentation that strongly reflects the chosen style
+- characteristic rhythm and harmony patterns of the style
+- phrasing and arrangement that clearly define the genre"""
+
+        return core, focus
+
+    # -----------------------------
+    # Build Full Prompt
+    # -----------------------------
+
     def build_prompt(
-        cls,
-        target_style: str,
-        target_emotion: str,
-        orig_style: str | None = None,
-        orig_emotion: str | None = None,
-        style_prob: dict | None = None,
-        emotion_prob: dict | None = None,
-        attempt: int = 1,
-    ) -> str:
-        target_style = (target_style or "").lower().strip()
-        target_emotion = (target_emotion or "").lower().strip()
+        self,
+        melody_info,
+        target_style,
+        target_emotion,
+        creativity=1.0,
+        attempt=1,
+    ):
+        """
+        melody_info 字典字段:
+            - pitch_range
+            - hook_score
+            - contour_score
+            - rhythm_score
+            - scale_corr
+            - key
+        """
 
-        style_desc = cls._describe_style(target_style)
-        emotion_desc = cls.EMOTION_PROFILE.get(target_emotion, target_emotion)
+        pr_desc = self.describe_pitch_range(melody_info["pitch_range"])
+        hook_desc = self.describe_hook(melody_info["hook_score"])
+        contour_desc = self.describe_contour(melody_info["contour_score"])
+        rhythm_desc = self.describe_rhythm(melody_info["rhythm_score"])
+        scale_desc = self.describe_scale(melody_info["scale_corr"])
 
-        # 1) 原歌曲描述（来自你的模型）
-        header_parts = []
-        if orig_style or orig_emotion:
-            parts = []
-            if orig_style:
-                parts.append(f"{orig_style} style")
-            if orig_emotion:
-                parts.append(f"{orig_emotion} emotion")
-            header_parts.append(
-                "The input audio is automatically analyzed as having "
-                f"{' and '.join(parts)}. "
-            )
+        # 旋律部分
+        melody_part = f"""
+### Melody Characteristics
+The extracted melody features:
+- {pr_desc}
+- {contour_desc}
+- {hook_desc}
+- {rhythm_desc}
+- {scale_desc}
+- key signature: {melody_info.get("key", "unknown")}
+"""
 
-        if style_prob:
-            header_parts.append(f"Style distribution: {style_prob}. ")
-        if emotion_prob:
-            header_parts.append(f"Emotion distribution: {emotion_prob}. ")
+        # 风格说明（风格增强）
+        style_name, style_focus = self.describe_style(target_style)
+        style_part = f"""
+### Target Style
+Rewrite the music into **{style_name}** style.
 
-        header_parts.append(
-            f"Transform it into {target_style} style music expressing {emotion_desc}. "
-        )
-        header = "".join(header_parts)
+Focus on:
+{style_focus}
+"""
 
-        # 2) 风格模板
-        style_part = (
-            f"In the target {target_style} style, use the following characteristics: "
-            f"{style_desc} "
-        )
+        # 情绪说明（原逻辑保留）
+        emotion_part = f"""
+### Target Emotion
+The emotional direction should be: **{target_emotion}**.
 
-        # 3) 旋律保留比例随 attempt 变化
-        if attempt <= 1:
-            melody_part = (
-                "Preserve around 60–70% of the original melodic contour so the track is clearly "
-                "recognizable, but re-orchestrate it in the target style. "
-            )
-        elif attempt == 2:
-            melody_part = (
-                "Preserve around 40–60% of the original melodic contour, allowing noticeable "
-                "variation in rhythm and phrasing while staying recognizable. "
-            )
-        elif attempt == 3:
-            melody_part = (
-                "Preserve only around 20–40% of the original melodic contour, focusing more on "
-                "the target style and emotion while keeping a subtle hint of the original idea. "
-            )
-        else:
-            melody_part = (
-                "Preserve only a small trace of the original melodic contour; prioritize the "
-                "target style and emotion, letting the music evolve more freely. "
-            )
+Include:
+- emotional tone and expressive phrasing that match {target_emotion}
+- energy level and atmosphere consistent with {target_emotion}
+"""
 
-        # 4) 风格/情绪强化
-        if attempt <= 1:
-            strength = (
-                f"Clearly emphasize {target_style} style and {target_emotion} emotion, while "
-                "keeping the musical flow smooth and coherent. "
-            )
-        elif attempt == 2:
-            strength = (
-                f"Make the {target_style} style and {target_emotion} emotion very obvious to the "
-                "listener, even more than in the original track. "
-            )
-        elif attempt == 3:
-            strength = (
-                f"Strongly prioritize {target_style} aesthetics and {target_emotion} expression, "
-                "even if it changes the original character. "
-            )
-        else:
-            strength = (
-                f"Aggressively push towards pure {target_style} aesthetics with unmistakable "
-                f"{target_emotion} emotion, letting the music feel like a strong stylistic remake. "
-            )
+        # 生成要求
+        requirements = f"""
+### Requirements
+- Preserve the recognizable melodic identity while allowing creative variation.
+- Adapt harmony, rhythm, and instrumentation strongly toward **{style_name}**.
+- Maintain emotional color consistent with **{target_emotion}**.
+- Avoid silence, ensure smooth transitions between sections.
+- Produce musically coherent, structured output with clear genre characteristics.
+"""
 
-        # 5) 防静音 + 连续性 + 质量
-        quality = (
-            "Ensure continuous musical texture throughout the entire duration, with no silent or "
-            "empty sections and no sudden dropouts of energy. High-quality studio mix, balanced EQ, "
-            "wide stereo image, expressive dynamics, instrumental only, no vocals, no noise or clipping. "
+        # 提示 MusicGen 进行逐轮改善
+        meta = f"### Generation Attempt: {attempt}\nCreativity Level: {creativity:.2f}\n"
+
+        final_prompt = (
+            "You are transforming music based on structured melodic analysis.\n\n"
+            + meta
+            + melody_part
+            + style_part
+            + emotion_part
+            + requirements
         )
 
-        return header + style_part + melody_part + strength + quality
+        return final_prompt

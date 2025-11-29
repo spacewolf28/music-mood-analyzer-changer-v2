@@ -1,211 +1,311 @@
 # backend/inference/full_pipeline.py
+# FullPipeline Ultimate Version
+# - Integrated Scoring System v4 (0~100)
+# - Friendly PromptBuilder support
+# - Melody-aware multi-attempt generation
+# - Auto early-stop at high score
 
 from pathlib import Path
-import time
+import numpy as np
+import librosa
+from scipy.spatial.distance import jensenshannon
 
-from .analyze import analyzer
-from .prompt_builder import PromptBuilder
-from .melody_extractor import MelodyExtractor
-from .melody_transformer import MelodyTransformer
-from .generate_music import MusicGenerator
+from backend.inference.analyze import analyzer
+from backend.inference.prompt_builder import PromptBuilder
+from backend.inference.melody_extractor import MelodyExtractor
+from backend.inference.melody_transformer import MelodyTransformer
+from backend.inference.generate_music import MusicGenerator
 
+
+# ============================================================
+# 评分体系逻辑（与 evaluate_generated v4 一致）
+# ============================================================
+
+def gain_score(gain):
+    if gain >= 0.35: return 20
+    elif gain >= 0.20: return 16
+    elif gain >= 0.10: return 12
+    elif gain >= 0.00: return 8
+    else: return 3
+
+
+def escape_score(escape):
+    if escape >= 0.45: return 20
+    elif escape >= 0.25: return 15
+    elif escape >= 0.10: return 10
+    elif escape >= 0.00: return 5
+    else: return 0
+
+
+def js_score(js):
+    if js >= 0.40: return 20
+    elif js >= 0.30: return 16
+    elif js >= 0.20: return 12
+    elif js >= 0.10: return 8
+    else: return 3
+
+
+def confidence_score(conf):
+    if conf >= 0.75: return 20
+    elif conf >= 0.60: return 15
+    elif conf >= 0.45: return 10
+    else: return 5
+
+
+def compute_final_score(orig, gen, target_style, target_emotion):
+    """计算 0~100 综合分"""
+
+    sp_orig = orig["style_prob"]
+    sp_gen = gen["style_prob"]
+    ep_orig = orig["emotion_prob"]
+    ep_gen = gen["emotion_prob"]
+
+    # --- Gains ---
+    style_gain = sp_gen.get(target_style, 0) - sp_orig.get(target_style, 0)
+    emo_gain = ep_gen.get(target_emotion, 0) - ep_orig.get(target_emotion, 0)
+
+    # --- Escape original style ---
+    escape = sp_orig.get(orig["style"], 0) - sp_gen.get(orig["style"], 0)
+
+    # --- JS Divergence ---
+    js_style = jensenshannon(np.array(list(sp_orig.values())),
+                             np.array(list(sp_gen.values())))
+    js_emo = jensenshannon(np.array(list(ep_orig.values())),
+                           np.array(list(ep_gen.values())))
+    js_total = (js_style + js_emo) / 2
+
+    # --- Confidence ---
+    confidence = (max(sp_gen.values()) + max(ep_gen.values())) / 2
+
+    # --- Sub-scores ---
+    sg = gain_score(style_gain)
+    eg = gain_score(emo_gain)
+    esc = escape_score(escape)
+    js_s = js_score(js_total)
+    cf = confidence_score(confidence)
+
+    total = sg + eg + esc + js_s + cf
+
+    result = {
+        "total": total,
+        "style_gain": style_gain,
+        "emotion_gain": emo_gain,
+        "escape": escape,
+        "js": js_total,
+        "confidence": confidence,
+        "details": (sg, eg, esc, js_s, cf),
+    }
+    return result
+
+
+# ============================================================
+# Full pipeline
+# ============================================================
 
 class FullMusicPipeline:
-    """
-    方案 A：多 attempt 自动再生成 + 不掉音版流水线
-
-    流程：
-    - 使用你的 style/emotion 模型分析原歌
-    - 使用 PromptBuilder 构造随 attempt 变化的 prompt
-    - 使用 MelodyExtractor + MelodyTransformer 逐步弱化/变形旋律
-    - 使用 MusicGen-medium 生成 ~15 秒音乐（带 anti-collapse）
-    - 再用你的模型分析生成结果，根据 style/emotion 命中打分，选最佳版本
-    """
 
     def __init__(self):
         self.analyzer = analyzer
         self.prompt_builder = PromptBuilder()
         self.melody_extractor = MelodyExtractor()
         self.melody_transformer = MelodyTransformer()
-        self.music_generator = MusicGenerator()
+        self.music_gen = MusicGenerator()
 
     @staticmethod
-    def score_generation(
-        predicted_style: str,
-        predicted_emotion: str,
-        target_style: str,
-        target_emotion: str,
-    ) -> int:
-        """
-        简单评分：
-        - style 命中 +1
-        - emotion 命中 +1
-        """
-        score = 0
-        if predicted_style and predicted_style.lower() == target_style.lower():
-            score += 1
-        if predicted_emotion and predicted_emotion.lower() == target_emotion.lower():
-            score += 1
-        return score
+    def guidance_for_attempt(a):
+        return {1: 3.8, 2: 3.6, 3: 3.4}.get(a, 3.2)
 
-    @staticmethod
-    def guidance_for_attempt(attempt: int) -> float:
-        """
-        尝试次数 → guidance_scale：
-        - 1: 3.8（旋律最稳）
-        - 2: 3.6
-        - 3: 3.4
-        - >=4: 3.2
-        """
-        if attempt <= 1:
-            return 3.8
-        elif attempt == 2:
-            return 3.6
-        elif attempt == 3:
-            return 3.4
+    # ----------------------------------
+    # Melody info
+    # ----------------------------------
+    def build_melody_info(self, audio_path):
+
+        # 提取一段旋律音频，供分析使用
+        tmp = self.melody_extractor.extract_melody_to_wav(
+            audio_path,
+            strength=0.9,
+            weaken_level=0,
+            output_path="backend/output/_tmp_analysis_melody.wav",
+        )
+
+        # key 信息基于完整音频
+        y_full, sr_full = self.melody_extractor._load_audio(audio_path)
+        tonic_pc, mode, key_name = self.melody_extractor._detect_key(y_full, sr_full)
+
+        # 对提取的旋律进行 f0 分析
+        y, sr = self.melody_extractor._load_audio(tmp)
+        f0 = self.melody_extractor._extract_f0(y, sr)
+
+        if f0 is None:
+            f0_valid = np.array([])
         else:
-            return 3.2
+            f0_valid = f0[~np.isnan(f0)]
+            if f0_valid.size == 0:
+                f0_valid = np.array([])
 
-    def process(
-        self,
-        audio_path: str,
-        target_style: str,
-        target_emotion: str,
-        output_dir: str = "backend/output",
-        max_attempts: int = 4,
-    ):
+        # 评分器来自 PromptBuilder.scorer
+        scorer = self.prompt_builder.scorer
+
+        # pitch range
+        if len(f0_valid):
+            pitch_range = float(np.max(f0_valid) - np.min(f0_valid))
+        else:
+            pitch_range = 0.0
+
+        # f0 相关的评分需要判空
+        if f0 is None or f0_valid.size == 0:
+            hook_score = 0.0
+            scale_corr = 0.0
+            contour_score = 0.0
+        else:
+            hook_score = float(scorer.hook_score(f0))
+            scale_corr = float(scorer.scale_score(f0))
+            contour_score = float(scorer.contour_score(f0))
+
+        rhythm_score = float(scorer.rhythm_score(y, sr))
+
+        return {
+            "key": key_name,
+            "f0_valid": f0_valid,
+            "pitch_range": pitch_range,
+            "hook_score": hook_score,
+            "rhythm_score": rhythm_score,
+            "scale_corr": scale_corr,
+            "contour_score": contour_score,
+        }
+
+    # ----------------------------------
+    # Main process
+    # ----------------------------------
+    def process(self, audio_path, target_style, target_emotion,
+                output_dir="backend/output", max_attempts=4):
+
         audio_path = Path(audio_path)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        if not audio_path.is_file():
-            raise FileNotFoundError(f"Input audio not found: {audio_path}")
+        # --- Analyze original ---
+        print("🔍 Analyzing original audio…")
+        orig = self.analyzer.analyze(str(audio_path))
 
-        # 1. 用你的模型分析原歌
-        print("🔍 [1/6] Analyzing original audio with your models...")
-        analysis = self.analyzer.analyze(str(audio_path))
-        orig_style = analysis.get("style")
-        orig_emotion = analysis.get("emotion")
-        style_prob = analysis.get("style_prob")
-        emotion_prob = analysis.get("emotion_prob")
+        # --- Melody info ---
+        print("\n🎼 Extracting melody info…")
+        try:
+            melody_info = self.build_melody_info(str(audio_path))
+        except Exception as e:
+            print("[WARN] melody info failed:", e)
+            melody_info = {
+                "key": "unknown",
+                "pitch_range": 0,
+                "hook_score": 0,
+                "rhythm_score": 0,
+                "scale_corr": 0,
+                "contour_score": 0,
+            }
 
-        print(f"   → Input Style:   {orig_style}")
-        print(f"   → Input Emotion: {orig_emotion}")
-
-        # 全局记录最佳结果
         best_score = -1
-        best_output_path: str | None = None
-        best_result: dict | None = None
+        best_output = None
+        best_result = None
 
-        print("\n🎶 [2/6] Start Auto-Regenerate loop...")
+        print("\n🎶 Multi-attempt generation…")
         for attempt in range(1, max_attempts + 1):
-            print(f"\n================ ATTEMPT {attempt}/{max_attempts} ================")
 
-            # 2. 构造 Prompt
-            print("🧠 Building prompt...")
-            prompt = PromptBuilder.build_prompt(
+            print(f"\n========== Attempt {attempt}/{max_attempts} ==========")
+
+            # --- prompt ---
+            prompt = self.prompt_builder.build_prompt(
+                melody_info=melody_info,
                 target_style=target_style,
                 target_emotion=target_emotion,
-                orig_style=orig_style,
-                orig_emotion=orig_emotion,
-                style_prob=style_prob,
-                emotion_prob=emotion_prob,
                 attempt=attempt,
+                creativity=1.0,
             )
-            print("----- Prompt -----")
-            print(prompt)
-            print("------------------")
 
-            # 3. Melody 提取（随 attempt 改变长度）+ 变形
-            print("\n🎼 Extracting & transforming melody...")
-            weaken_level = attempt - 1
-            raw_melody_path = self.melody_extractor.extract_melody_to_wav(
+            print("\n🧠 Prompt:")
+            print(prompt)
+
+            # --- melody extract (默认 mode='low'，更稳定)
+            raw = self.melody_extractor.extract_melody_to_wav(
                 str(audio_path),
                 target_style=target_style,
                 target_emotion=target_emotion,
                 strength=0.9,
                 output_path=output_dir / f"melody_attempt_{attempt}.wav",
-                weaken_level=weaken_level,
+                weaken_level=attempt - 1,
+                # mode 不传则使用默认 "low"
             )
 
-            transformed_melody_path = self.melody_transformer.transform(
-                raw_melody_path, attempt=attempt
+            # --- melody transform ---
+            transformed = self.melody_transformer.transform(
+                raw,
+                attempt=attempt,
+                prev_score=best_score,  # 这里仍然用总分作为反馈强度，不改大逻辑
             )
 
-            # 4. 调用 MusicGen 生成
-            print("\n🎧 Generating with MusicGen (medium)...")
-            output_audio_path = output_dir / f"generated_attempt_{attempt}.wav"
-            guidance_scale = self.guidance_for_attempt(attempt)
+            # --- generate ---
+            out_file = output_dir / f"generated_attempt_{attempt}.wav"
+            print("\n🎧 Generating MusicGen output…")
 
-            self.music_generator.generate_with_melody(
+            self.music_gen.generate_with_melody(
                 prompt=prompt,
-                melody_path=str(transformed_melody_path),
-                output_path=str(output_audio_path),
+                melody_path=str(transformed),
+                output_path=str(out_file),
                 target_seconds=15.0,
-                guidance_scale=guidance_scale,
+                guidance_scale=self.guidance_for_attempt(attempt),
                 temperature=1.0,
                 top_p=0.95,
                 do_sample=True,
             )
 
-            # 5. 使用你的模型分析生成结果
-            print("\n📊 Analyzing generated audio with your models...")
-            gen_result = self.analyzer.analyze(str(output_audio_path))
-            pred_style = gen_result.get("style")
-            pred_emotion = gen_result.get("emotion")
+            # --- analyze ---
+            gen = self.analyzer.analyze(str(out_file))
 
-            print(f"   → Generated Style:   {pred_style}")
-            print(f"   → Generated Emotion: {pred_emotion}")
+            # --- score v4 ---
+            score_info = compute_final_score(orig, gen, target_style, target_emotion)
+            score_total = score_info["total"]
 
-            score = self.score_generation(
-                pred_style, pred_emotion,
-                target_style, target_emotion,
-            )
-            print(f"➡ Score for this attempt: {score} / 2")
+            print("\n📊 Score Breakdown:")
+            print(f"  Total Score:  {score_total:.2f} / 100")
+            print(f"  Style Gain:   {score_info['style_gain']:+.3f}")
+            print(f"  Emotion Gain: {score_info['emotion_gain']:+.3f}")
+            print(f"  Escape:       {score_info['escape']:+.3f}")
+            print(f"  JS Diverg.:   {score_info['js']:.3f}")
+            print(f"  Confidence:   {score_info['confidence']:.3f}")
 
-            # 记录最佳结果
-            if score > best_score:
-                best_score = score
-                best_output_path = str(output_audio_path)
-                best_result = gen_result
+            # --- keep best ---
+            if score_total > best_score:
+                best_score = score_total
+                best_output = str(out_file)
+                best_result = gen
 
-            # style + emotion 全命中可以提前 stop
-            if score == 2:
-                print("✨ Perfect style + emotion match! Stop early.")
+            # --- early stop ---
+            if score_total >= 90:
+                print("✨ High-quality result achieved (A+). Early stop.")
                 break
 
-            time.sleep(1)
+        print("\n🎉 Final Result")
+        print("Best Score:", best_score)
+        if best_result is not None:
+            print("Best Style:", best_result.get("style"))
+            print("Best Emotion:", best_result.get("emotion"))
+        else:
+            print("Best Style: N/A")
+            print("Best Emotion: N/A")
+        print("Best File:", best_output)
 
-        # 6. 输出最终最佳结果
-        print("\n🎉 [6/6] Final Best Result:")
-        if best_result is None or best_output_path is None:
-            print("⚠ 没有成功生成任何结果，请检查上面的日志。")
-            return None
+        return best_output
 
-        print("Best Style:   ", best_result.get("style"))
-        print("Best Emotion: ", best_result.get("emotion"))
-        print("Best Score:   ", best_score)
-        print("Best File:    ", best_output_path)
 
-        print("\n============== CHANGE SUMMARY ==============")
-        print(f"Style:   {orig_style} → {best_result.get('style')}")
-        print(f"Emotion: {orig_emotion} → {best_result.get('emotion')}")
-        print("===========================================\n")
-
-        return best_output_path
-
+# ============================================================
+# Run
+# ============================================================
 
 if __name__ == "__main__":
     pipeline = FullMusicPipeline()
-
-    INPUT_AUDIO = r"backend/test_audio.wav"   # 换成你的测试音频
-    TARGET_STYLE = "rock"                     # rock / jazz / classical / pop / electronic
-    TARGET_EMOTION = "happy"                  # angry / funny / happy / sad / scary / tender
-
     pipeline.process(
-        audio_path=INPUT_AUDIO,
-        target_style=TARGET_STYLE,
-        target_emotion=TARGET_EMOTION,
+        audio_path="backend/test_audio.wav",
+        target_style="rock",
+        target_emotion="happy",
         output_dir="backend/output",
         max_attempts=4,
     )
